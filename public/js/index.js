@@ -12,7 +12,9 @@ import Idle from 'Idle.Js'
 
 import '../vendor/jquery-textcomplete/jquery.textcomplete'
 
-import { ot } from '../vendor/ot/ot.min.js'
+// braid-text client (replaces OT library)
+import '../vendor/braid-http-client.js'
+import '../vendor/simpleton-sync.js'
 import hex2rgb from '../vendor/ot/hex2rgb'
 
 import { saveAs } from 'file-saver'
@@ -2234,7 +2236,7 @@ socket.on('delete', function () {
 })
 let retryTimer = null
 socket.on('maintenance', function () {
-  cmClient.revision = -1
+  braidSynced = false
 })
 socket.on('disconnect', function (data) {
   showStatus(statusType.offline)
@@ -2608,33 +2610,19 @@ socket.on('refresh', function (data) {
   }
 })
 
-const EditorClient = ot.EditorClient
-const SocketIOAdapter = ot.SocketIOAdapter
-const CodeMirrorAdapter = ot.CodeMirrorAdapter
-let cmClient = null
-let synchronized_ = null
+let braidSynced = false
+let braidSimpleton = null
 
 function havePendingOperation () {
-  return !!(
-    cmClient &&
-    cmClient.state &&
-    Object.prototype.hasOwnProperty.call(cmClient, 'outstanding')
-  )
+  return !braidSynced
 }
 
 socket.on('doc', function (obj) {
   const body = obj.str
   const bodyMismatch = editor.getValue() !== body
-  const setDoc =
-    !cmClient ||
-    (cmClient &&
-      (cmClient.revision === -1 ||
-        (cmClient.revision !== obj.revision && !havePendingOperation()))) ||
-    obj.force
 
   saveInfo()
-  if (setDoc && bodyMismatch) {
-    if (cmClient) cmClient.editorAdapter.ignoreNextChange = true
+  if (bodyMismatch) {
     if (body) editor.setValue(body)
     else editor.setValue('')
   }
@@ -2644,34 +2632,49 @@ socket.on('doc', function (obj) {
     ui.spinner.hide()
     ui.content.fadeIn()
   } else {
-    // if current doc is equal to the doc before disconnect
-    if (setDoc && bodyMismatch) editor.clearHistory()
+    if (bodyMismatch) editor.clearHistory()
     else if (lastInfo.history) editor.setHistory(lastInfo.history)
     lastInfo.history = null
   }
 
-  if (!cmClient) {
-    cmClient = window.cmClient = new EditorClient(
-      obj.revision,
-      obj.clients,
-      new SocketIOAdapter(socket),
-      new CodeMirrorAdapter(editor)
-    )
-    synchronized_ = cmClient.state
-  } else if (setDoc) {
-    if (bodyMismatch) {
-      cmClient.undoManager.undoStack.length = 0
-      cmClient.undoManager.redoStack.length = 0
-    }
-    cmClient.revision = obj.revision
-    cmClient.setState(synchronized_)
-    cmClient.initializeClientList()
-    cmClient.initializeClients(obj.clients)
-  } else if (havePendingOperation()) {
-    cmClient.serverReconnect()
+  // Initialize braid simpleton client if we have a braid URL
+  if (obj.braidUrl && !braidSimpleton) {
+    /* global simpleton_client */
+    braidSimpleton = simpleton_client(obj.braidUrl, {
+      // Apply remote patches to CodeMirror
+      on_patches: function (patches) {
+        editor.operation(function () {
+          let offset = 0
+          for (let i = 0; i < patches.length; i++) {
+            const p = patches[i]
+            const from = editor.posFromIndex(p.range[0] + offset)
+            const to = editor.posFromIndex(p.range[1] + offset)
+            editor.replaceRange(p.content, from, to, 'ignoreHistory')
+            offset += p.content.length - (p.range[1] - p.range[0])
+          }
+        })
+        isDirty = true
+        updateView()
+      },
+      // Return current editor state
+      get_state: function () {
+        return editor.getValue()
+      },
+      on_error: function (e) {
+        console.error('braid sync error:', e)
+      }
+    })
+
+    braidSynced = true
+  } else if (braidSimpleton && bodyMismatch) {
+    // Reconnection with body mismatch -- restart simpleton
+    braidSimpleton.abort()
+    braidSimpleton = null
+    braidSynced = false
+    // Re-initialize on next doc event
   }
 
-  if (setDoc && bodyMismatch) {
+  if (bodyMismatch) {
     isDirty = true
     updateView()
   }
@@ -2679,14 +2682,13 @@ socket.on('doc', function (obj) {
   restoreInfo()
 })
 
-socket.on('ack', function () {
-  isDirty = true
-  updateView()
-})
-
-socket.on('operation', function () {
-  isDirty = true
-  updateView()
+// Wire CodeMirror local changes to simpleton (registered once, outside doc handler)
+editor.on('changes', function (cm, changes) {
+  // Only notify simpleton of non-remote changes
+  const isRemote = changes.every(function (c) { return c.origin === 'ignoreHistory' || c.origin === 'setValue' })
+  if (!isRemote && braidSimpleton) {
+    braidSimpleton.changed()
+  }
 })
 
 socket.on('online users', function (data) {
@@ -3259,9 +3261,6 @@ editorInstance.on('beforeChange', function (cm, change) {
       setHaveUnreadChanges(true)
       updateTitleReminder()
     }
-  }
-  if (cmClient && !socket.connected) {
-    cmClient.editorAdapter.ignoreNextChange = true
   }
 })
 editorInstance.on('cut', function () {

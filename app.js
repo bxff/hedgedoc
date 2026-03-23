@@ -266,6 +266,10 @@ app.use(require('./lib/web/userRouter'))
 app.use(require('./lib/web/imageRouter'))
 app.use(require('./lib/web/note/router'))
 
+// braid-text document sync endpoint (replaces OT for document synchronization)
+const { braidMiddleware } = require('./lib/braid-server')
+app.use('/braid', braidMiddleware)
+
 // response not found if no any route matxches
 app.get('*', function (req, res) {
   errors.errorNotFound(res)
